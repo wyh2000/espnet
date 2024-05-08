@@ -20,10 +20,12 @@ train_set=train-clean-460
 valid_set=dev-clean
 test_sets="dev-clean test-clean"
 
-train_config=conf/train_soundstream2.yaml
+train_config=conf/train_dac_24000_eucliean_5.yaml
 inference_config=conf/decode.yaml
 
 ./codec.sh \
+    --stage 5 \
+    --stop_stage 5 \
     --local_data_opts "--trim_all_silence false" \
     --train_config "${train_config}" \
     --inference_config "${inference_config}" \

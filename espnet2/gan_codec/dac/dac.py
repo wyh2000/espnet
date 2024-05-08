@@ -1,7 +1,7 @@
-# Copyright 2024 Jiatong Shi
+# Copyright 2024 Yihan Wu
 #  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
-"""SoundStream Modules."""
+"""DAC Modules."""
 
 import copy
 import logging
@@ -20,6 +20,7 @@ from espnet2.gan_codec.shared.decoder.seanet import SEANetDecoder
 from espnet2.gan_codec.shared.discriminator.stft_discriminator import (
     ComplexSTFTDiscriminator,
 )
+from espnet2.gan_codec.shared.discriminator.msmpmb_discriminator import MultiScaleMultiPeriodMultiBandDiscriminator
 from espnet2.gan_codec.shared.encoder.seanet import SEANetEncoder
 from espnet2.gan_codec.shared.loss.freq_loss import MultiScaleMelSpectrogramLoss
 from espnet2.gan_codec.shared.quantizer.residual_vq import ResidualVectorQuantizer
@@ -32,8 +33,8 @@ from espnet2.gan_tts.hifigan.loss import (
 from espnet2.torch_utils.device_funcs import force_gatherable
 
 
-class SoundStream(AbsGANCodec):
-    """ "SoundStream model."""
+class DAC(AbsGANCodec):
+    """ "DAC model."""
 
     @typechecked
     def __init__(
@@ -45,8 +46,8 @@ class SoundStream(AbsGANCodec):
             "encdec_n_filters": 32,
             "encdec_n_residual_layers": 1,
             "encdec_ratios": [8, 5, 4, 2],
-            "encdec_activation": "ELU",
-            "encdec_activation_params": {"alpha": 1.0},
+            "encdec_activation": "Snake",
+            "encdec_activation_params": {},
             "encdec_norm": "weight_norm",
             "encdec_norm_params": {},
             "encdec_kernel_size": 7,
@@ -68,6 +69,7 @@ class SoundStream(AbsGANCodec):
             "quantizer_kmeans_iters": 50,
             "quantizer_threshold_ema_dead_code": 2,
             "quantizer_target_bandwidth": [7.5, 15],
+            "codebook_type": "cosinesimilarity",
         },
         discriminator_params: Dict[str, Any] = {
             "scales": 3,
@@ -137,7 +139,7 @@ class SoundStream(AbsGANCodec):
         lambda_mel: float = 45.0,
         cache_generator_outputs: bool = False,
     ):
-        """Intialize SoundStream model.
+        """Intialize DAC model.
 
         Args:
              TODO(jiatong)
@@ -146,8 +148,8 @@ class SoundStream(AbsGANCodec):
 
         # define modules
         generator_params.update(sample_rate=sampling_rate)
-        self.generator = SoundStreamGenerator(**generator_params)
-        self.discriminator = SoundStreamDiscriminator(**discriminator_params)
+        self.generator = DACGenerator(**generator_params)
+        self.discriminator = DACDiscriminator(**discriminator_params)
         self.generator_adv_loss = GeneratorAdversarialLoss(
             **generator_adv_loss_params,
         )
@@ -445,20 +447,21 @@ class SoundStream(AbsGANCodec):
         return self.generator.decode(x)
 
 
-class SoundStreamGenerator(nn.Module):
-    """SoundStream generator module."""
+class DACGenerator(nn.Module):
+    """DAC generator module."""
 
     @typechecked
     def __init__(
         self,
         sample_rate: int = 24000,
         hidden_dim: int = 128,
+        codebook_dim: int = 8,
         encdec_channels: int = 1,
         encdec_n_filters: int = 32,
         encdec_n_residual_layers: int = 1,
         encdec_ratios: List[int] = [8, 5, 4, 2],
-        encdec_activation: str = "ELU",
-        encdec_activation_params: Dict[str, Any] = {"alpha": 1.0},
+        encdec_activation: str = "Snake",
+        encdec_activation_params: Dict[str, Any] = {},
         encdec_norm: str = "weight_norm",
         encdec_norm_params: Dict[str, Any] = {},
         encdec_kernel_size: int = 7,
@@ -480,8 +483,10 @@ class SoundStreamGenerator(nn.Module):
         quantizer_kmeans_iters: int = 50,
         quantizer_threshold_ema_dead_code: int = 2,
         quantizer_target_bandwidth: List[float] = [7.5, 15],
+        codebook_type: str = "cosinesimilarity",
+        quantizer_dropout: bool = True,
     ):
-        """Initialize SoundStream Generator.
+        """Initialize DAC Generator.
 
         Args:
             TODO(jiatong)
@@ -513,12 +518,15 @@ class SoundStreamGenerator(nn.Module):
         # Initialize quantizer
         self.quantizer = ResidualVectorQuantizer(
             dimension=hidden_dim,
+            codebook_dim=codebook_dim,
             n_q=quantizer_n_q,
             bins=quantizer_bins,
             decay=quantizer_decay,
             kmeans_init=quantizer_kmeans_init,
             kmeans_iters=quantizer_kmeans_iters,
             threshold_ema_dead_code=quantizer_threshold_ema_dead_code,
+            codebook_type=codebook_type,
+            quantizer_dropout=quantizer_dropout
         )
         self.target_bandwidths = quantizer_target_bandwidth
         self.sample_rate = sample_rate
@@ -554,7 +562,7 @@ class SoundStreamGenerator(nn.Module):
         self.l2_quantization_loss = torch.nn.MSELoss(reduction="mean")
 
     def forward(self, x: torch.Tensor, use_dual_decoder: bool = False):
-        """Soundstream forward propagation.
+        """DAC forward propagation.
 
         Args:
             x (torch.Tensor): Input tensor of shape (B, 1, T).
@@ -572,11 +580,11 @@ class SoundStreamGenerator(nn.Module):
         bw = self.target_bandwidths[random.randint(0, max_idx)]
 
         # Forward quantizer
-        quantized, _, _, commit_loss, _ = self.quantizer(encoder_out, self.frame_rate, bw)
+        quantized, _, _, commit_loss, quantization_loss = self.quantizer(encoder_out, self.frame_rate, bw)
 
-        quantization_loss = self.l1_quantization_loss(
-            encoder_out, quantized
-        ) + self.l2_quantization_loss(encoder_out, quantized)
+        # quantization_loss = self.l1_quantization_loss(
+        #     encoder_out, quantized
+        # ) + self.l2_quantization_loss(encoder_out, quantized)
 
         resyn_audio = self.decoder(quantized)
 
@@ -591,7 +599,7 @@ class SoundStreamGenerator(nn.Module):
         x: torch.Tensor,
         target_bw: Optional[float] = None,
     ):
-        """Soundstream codec encoding.
+        """DAC codec encoding.
 
         Args:
             x (torch.Tensor): Input tensor of shape (B, 1, T).
@@ -612,7 +620,7 @@ class SoundStreamGenerator(nn.Module):
         return codes
 
     def decode(self, codes: torch.Tensor):
-        """Soundstream codec decoding.
+        """DAC codec decoding.
 
         Args:
             codecs (torch.Tensor): neural codecs in shape ().
@@ -624,8 +632,8 @@ class SoundStreamGenerator(nn.Module):
         return resyn_audio
 
 
-class SoundStreamDiscriminator(nn.Module):
-    """SoundStream discriminator module."""
+class DACDiscriminator(nn.Module):
+    """DAC discriminator module."""
 
     def __init__(
         self,
@@ -638,32 +646,38 @@ class SoundStreamDiscriminator(nn.Module):
             "stride": 2,
             "padding": 2,
         },
-        scale_discriminator_params: Dict[str, Any] = {
-            "in_channels": 1,
-            "out_channels": 1,
-            "kernel_sizes": [15, 41, 5, 3],
-            "channels": 128,
-            "max_downsample_channels": 1024,
-            "max_groups": 16,
-            "bias": True,
-            "downsample_scales": [2, 2, 4, 4, 1],
-            "nonlinear_activation": "LeakyReLU",
-            "nonlinear_activation_params": {"negative_slope": 0.1},
+        # MultiScaleMultiPeriodMultiBand discriminator related
+        msmpmb_discriminator_params: Dict[str, Any] = {
+            "rates": [],
+            "periods": [2, 3, 5, 7, 11],
+            "fft_sizes": [2048, 1024, 512],
+            "sample_rate": 24000,
+            "periods": [2, 3, 5, 7, 11],
+            "period_discriminator_params": {
+                "in_channels": 1,
+                "out_channels": 1,
+                "kernel_sizes": [5, 3],
+                "channels": 32,
+                "downsample_scales": [3, 3, 3, 3, 1],
+                "max_downsample_channels": 1024,
+                "bias": True,
+                "nonlinear_activation": "LeakyReLU",
+                "nonlinear_activation_params": {"negative_slope": 0.1},
+                "use_weight_norm": True,
+                "use_spectral_norm": False,
+            },
+            "band_discriminator_params": {
+                "hop_factor": 0.25,
+                "sample_rate": 24000,
+                "bands": [(0.0, 0.1), (0.1, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0)],
+                "channel": 32,
+            }
         },
+        
         scale_follow_official_norm: bool = False,
-        # ComplexSTFT discriminator related
-        complexstft_discriminator_params: Dict[str, Any] = {
-            "in_channels": 1,
-            "channels": 32,
-            "strides": [[1, 2], [2, 2], [1, 2], [2, 2], [1, 2], [2, 2]],
-            "chan_mults": [1, 2, 4, 4, 8, 8],
-            "n_fft": 1024,
-            "hop_length": 256,
-            "win_length": 1024,
-            "stft_normalized": False,
-        },
+
     ):
-        """Initialize SoundStream Discriminator module.
+        """Initialize DAC Discriminator module.
 
         Args:
             scales (int): Number of multi-scales.
@@ -680,16 +694,9 @@ class SoundStreamDiscriminator(nn.Module):
                 complex stft discriminator module.
         """
         super().__init__()
-
-        self.msd = HiFiGANMultiScaleDiscriminator(
-            scales=scales,
-            downsample_pooling=scale_downsample_pooling,
-            downsample_pooling_params=scale_downsample_pooling_params,
-            discriminator_params=scale_discriminator_params,
-            follow_official_norm=scale_follow_official_norm,
-        )
-        self.complex_stft_d = ComplexSTFTDiscriminator(
-            **complexstft_discriminator_params
+        
+        self.msmpmb_discriminator = MultiScaleMultiPeriodMultiBandDiscriminator(
+            **msmpmb_discriminator_params
         )
 
     def forward(self, x: torch.Tensor) -> List[List[torch.Tensor]]:
@@ -704,6 +711,5 @@ class SoundStreamDiscriminator(nn.Module):
                 multi period ones are concatenated.
 
         """
-        msd_outs = self.msd(x)
-        complex_stft_outs = self.complex_stft_d(x)
-        return msd_outs + complex_stft_outs
+        msmpmb_outs = self.msmpmb_discriminator(x)
+        return msmpmb_outs

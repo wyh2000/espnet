@@ -251,6 +251,165 @@ class EuclideanCodebook(nn.Module):
         return quantize, embed_ind
 
 
+class CosineSimilarityCodebook(nn.Module):
+    """Codebook with Cosine Similarity.
+    Args:
+        dim (int): Dimension.
+        codebook_size (int): Codebook size.
+        kmeans_init (bool): Whether to use k-means to initialize the codebooks.
+            If set to true, run the k-means algorithm on the first training batch and use
+            the learned centroids as initialization.
+        kmeans_iters (int): Number of iterations used for k-means algorithm at initialization.
+        decay (float): Decay for exponential moving average over the codebooks.
+        epsilon (float): Epsilon value for numerical stability.
+        threshold_ema_dead_code (int): Threshold for dead code expiration. Replace any codes
+            that have an exponential moving average cluster size less than the specified threshold with
+            randomly selected vector from the current batch.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        codebook_size: int,
+        kmeans_init: int = False,
+        kmeans_iters: int = 10,
+        decay: float = 0.99,
+        epsilon: float = 1e-5,
+        threshold_ema_dead_code: int = 2,
+    ):
+        super().__init__()
+        self.decay = decay
+        init_fn: Union[Callable[..., torch.Tensor], Any] = (
+            uniform_init if not kmeans_init else torch.zeros
+        )
+        embed = init_fn(codebook_size, dim)
+
+        self.codebook_size = codebook_size
+
+        self.kmeans_iters = kmeans_iters
+        self.epsilon = epsilon
+        self.threshold_ema_dead_code = threshold_ema_dead_code
+
+        self.register_buffer("inited", torch.Tensor([not kmeans_init]))
+        self.register_buffer("cluster_size", torch.zeros(codebook_size))
+        self.register_buffer("embed", embed)
+        self.register_buffer("embed_avg", embed.clone())
+
+    @torch.jit.ignore
+    def init_embed_(self, data):
+        if self.inited:
+            return
+
+        embed, cluster_size = kmeans(data, self.codebook_size, self.kmeans_iters)
+        self.embed.data.copy_(embed)
+        self.embed_avg.data.copy_(embed.clone())
+        self.cluster_size.data.copy_(cluster_size)
+        self.inited.data.copy_(torch.Tensor([True]))
+        # Make sure all buffers across workers are in sync after initialization
+        broadcast_tensors(self.buffers())
+
+    def replace_(self, samples, mask):
+        modified_codebook = torch.where(
+            mask[..., None], sample_vectors(samples, self.codebook_size), self.embed
+        )
+        self.embed.data.copy_(modified_codebook)
+
+    def expire_codes_(self, batch_samples):
+        if self.threshold_ema_dead_code == 0:
+            return
+
+        expired_codes = self.cluster_size < self.threshold_ema_dead_code
+        if not torch.any(expired_codes):
+            return
+
+        batch_samples = rearrange(batch_samples, "... d -> (...) d")
+        self.replace_(batch_samples, mask=expired_codes)
+        broadcast_tensors(self.buffers())
+
+    def preprocess(self, x):
+        x = rearrange(x, "... d -> (...) d")
+        return x
+
+    def quantize(self, x):
+        embed = self.embed.t()
+        # L2 normalize encodings and codebook (ViT-VQGAN)
+        x = F.normalize(x)
+        embed = F.normalize(embed, dim=0)
+        
+        dist = -(
+            x.pow(2).sum(1, keepdim=True)
+            - 2 * x @ embed
+            + embed.pow(2).sum(0, keepdim=True)
+        )
+        embed_ind = dist.max(dim=-1).indices
+        return embed_ind
+
+    def postprocess_emb(self, embed_ind, shape):
+        return embed_ind.view(*shape[:-1])
+
+    def dequantize(self, embed_ind):
+        quantize = F.embedding(embed_ind, self.embed)
+        return quantize
+
+    def encode(self, x):
+        shape = x.shape
+        # pre-process
+        x = self.preprocess(x)
+        # quantize
+        embed_ind = self.quantize(x)
+        # post-process
+        embed_ind = self.postprocess_emb(embed_ind, shape)
+        return embed_ind
+
+    def decode(self, embed_ind):
+        quantize = self.dequantize(embed_ind)
+        return quantize
+
+    def forward(self, x):
+        """Codebook Forward with EMA.
+
+        Args:
+            x (Tensor): Vector for quantization (B, T, D)
+
+        Return:
+            Tensor: Quantized output (B, T, D)
+            Tensor: Codebook Index (B, T)
+        """
+        shape, dtype = x.shape, x.dtype
+        x = self.preprocess(x)  # (BxT, D)
+
+        # Initialize the embedding (only activated for the first time)
+        self.init_embed_(x)
+
+        # Quantization Process
+        embed_ind = self.quantize(x)  # (BxT)
+        embed_onehot = F.one_hot(embed_ind, self.codebook_size).type(dtype)  # (BxT, V)
+        embed_ind = self.postprocess_emb(embed_ind, shape)  # (B, T)
+        quantize = self.dequantize(embed_ind)  # (B, T, D)
+
+        if self.training:
+            # We do the expiry of code at that point as buffers are in sync
+            # and all the workers will take the same decision.
+            self.expire_codes_(x)
+
+            # ema update number of frames per cluster
+            ema_inplace(self.cluster_size, embed_onehot.sum(0), self.decay)
+
+            # Use encoder embedding to update ema with assignments
+            embed_sum = x.t() @ embed_onehot  # (D, BxT) @ (BxT, V) -> (D, V)
+
+            # ema udpate embedding
+            ema_inplace(self.embed_avg, embed_sum.t(), self.decay)
+            cluster_size = (
+                laplace_smoothing(self.cluster_size, self.codebook_size, self.epsilon)
+                * self.cluster_size.sum()
+            )
+            embed_normalized = self.embed_avg / cluster_size.unsqueeze(1)
+            self.embed.data.copy_(embed_normalized)
+
+        return quantize, embed_ind
+
+
 class VectorQuantization(nn.Module):
     """Vector quantization implementation.
     Currently supports only euclidean distance.
@@ -272,12 +431,14 @@ class VectorQuantization(nn.Module):
         dim: int,
         codebook_size: int,
         codebook_dim: Optional[int] = None,
+        codebook_type: str = "euclidean",
         decay: float = 0.99,
         epsilon: float = 1e-5,
         kmeans_init: bool = True,
         kmeans_iters: int = 50,
         threshold_ema_dead_code: int = 2,
         commitment_weight: float = 1.0,
+        quantizer_dropout: bool = False,
     ):
         super().__init__()
         _codebook_dim: int = default(codebook_dim, dim)
@@ -293,16 +454,31 @@ class VectorQuantization(nn.Module):
         self.epsilon = epsilon
         self.commitment_weight = commitment_weight
 
-        self._codebook = EuclideanCodebook(
-            dim=_codebook_dim,
-            codebook_size=codebook_size,
-            kmeans_init=kmeans_init,
-            kmeans_iters=kmeans_iters,
-            decay=decay,
-            epsilon=epsilon,
-            threshold_ema_dead_code=threshold_ema_dead_code,
-        )
+        if codebook_type == "euclidean":
+            self._codebook = EuclideanCodebook(
+                dim=_codebook_dim,
+                codebook_size=codebook_size,
+                kmeans_init=kmeans_init,
+                kmeans_iters=kmeans_iters,
+                decay=decay,
+                epsilon=epsilon,
+                threshold_ema_dead_code=threshold_ema_dead_code,
+            )
+        elif codebook_type == "cosinesimilarity":
+            self._codebook = CosineSimilarityCodebook(
+                dim=_codebook_dim,
+                codebook_size=codebook_size,
+                kmeans_init=kmeans_init,
+                kmeans_iters=kmeans_iters,
+                decay=decay,
+                epsilon=epsilon,
+                threshold_ema_dead_code=threshold_ema_dead_code,
+            )
+        else:
+            raise ValueError("Unsupported codebook type: {}".format(codebook_type))
+
         self.codebook_size = codebook_size
+        self.quantizer_dropout = quantizer_dropout
 
     @property
     def codebook(self):
@@ -320,7 +496,7 @@ class VectorQuantization(nn.Module):
         quantize = rearrange(quantize, "b n d -> b d n")
         return quantize
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         device = x.device
         x = rearrange(x, "b d n -> b n d")
         x = self.project_in(x)
@@ -330,15 +506,24 @@ class VectorQuantization(nn.Module):
         if self.training:
             quantize = x + (quantize - x).detach()
 
-        loss = torch.tensor([0.0], device=device, requires_grad=self.training)
-
+        commit_loss = torch.tensor([0.0], device=device, requires_grad=self.training)
+        quant_loss = torch.tensor([0.0], device=device, requires_grad=self.training)
         if self.training:
-            commit_loss = F.mse_loss(quantize.detach(), x)
-            loss = loss + commit_loss
+            if self.quantizer_dropout:
+                _commit_loss = F.mse_loss(quantize.detach(), x, reduction="none").mean([1, 2])
+                commit_loss = commit_loss + (_commit_loss * mask).mean()
+                _quant_loss = F.mse_loss(quantize, x.detach(), reduction="none").mean([1, 2])
+                quant_loss = quant_loss + (_quant_loss * mask).mean()
+                
+            else:
+                _commit_loss = F.mse_loss(quantize.detach(), x)
+                commit_loss = commit_loss + _commit_loss
+                _quant_loss = F.mse_loss(quantize, x.detach(), reduction="none")
+                quant_loss = quant_loss + _quant_loss
 
         quantize = self.project_out(quantize)
         quantize = rearrange(quantize, "b n d -> b d n")
-        return quantize, embed_ind, loss
+        return quantize, embed_ind, commit_loss, quant_loss
 
 
 class ResidualVectorQuantization(nn.Module):
@@ -352,31 +537,45 @@ class ResidualVectorQuantization(nn.Module):
         self.layers = nn.ModuleList(
             [VectorQuantization(**kwargs) for _ in range(num_quantizers)]
         )
+        self.quantizer_dropout = kwargs.get("quantizer_dropout")
 
     def forward(self, x, n_q: Optional[int] = None):
         quantized_out = 0.0
         residual = x
 
-        all_losses = []
+        all_commit_losses = []
+        all_quant_losses = []
         all_indices = []
 
         n_q = n_q or len(self.layers)
+        if self.training:
+            n_q = torch.ones((x.shape[0],)) * len(self.layers) + 1
+            dropout = torch.randint(1, len(self.layers) + 1, (x.shape[0],))
+            n_dropout = int(x.shape[0] * self.quantizer_dropout)
+            n_q[:n_dropout] = dropout[:n_dropout]
+            n_q = n_q.to(x.device)
 
-        for layer in self.layers[:n_q]:
-            quantized, indices, loss = layer(residual)
-            residual = residual - quantized
-            quantized_out = quantized_out + quantized
+        for i, layer in enumerate(self.layers):
+            if self.training is False and i >= n_q:
+                break
+            mask = torch.full((x.shape[0],), fill_value=i, device=x.device) < n_q
+            quantized_out_i, indices_i, commit_loss_i, quant_loss_i = layer(residual, mask)
 
-            all_indices.append(indices)
-            all_losses.append(loss)
+            # Create mask to apply quantizer dropout
+            quantized_out = quantized_out + quantized_out_i * mask[:, None, None]
+            residual = residual - quantized_out_i
+
+            all_indices.append(indices_i)
+            all_commit_losses.append(commit_loss_i)
+            all_quant_losses.append(quant_loss_i)
 
         if self.training:
             # Solving subtle bug with STE and RVQ
             # For more, https://github.com/facebookresearch/encodec/issues/25
             quantized_out = x + (quantized_out - x).detach()
 
-        out_losses, out_indices = map(torch.stack, (all_losses, all_indices))
-        return quantized_out, out_indices, out_losses
+        out_commit_losses, out_quant_losses, out_indices = map(torch.stack, (all_commit_losses, all_quant_losses, all_indices))
+        return quantized_out, out_indices, out_commit_losses, out_quant_losses
 
     def encode(
         self, x: torch.Tensor, n_q: Optional[int] = None, st: Optional[int] = None
