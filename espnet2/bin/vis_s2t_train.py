@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from espnet2.tasks.s2t_vis import S2TTask
+from espnet2.tasks.s2t_vis import VisS2TTask
 
 
 def get_parser():
@@ -16,7 +16,7 @@ def main(cmd=None):
                 > conf/train_s2t.yaml
         % python s2t_train.py --config conf/train_s2t.yaml
     """
-    S2TTask.main(cmd=cmd)
+    VisS2TTask.main(cmd=cmd)
 
 
 if __name__ == "__main__":

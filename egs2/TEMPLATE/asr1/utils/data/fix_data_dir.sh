@@ -53,7 +53,7 @@ function check_sorted {
   fi
 }
 
-for x in utt2spk spk2utt feats.scp text segments wav.scp cmvn.scp vad.scp \
+for x in utt2spk spk2utt feats.scp text segments wav.scp cmvn.scp vad.scp clip_feature \
     reco2file_and_channel spk2gender utt2lang utt2uniq utt2dur reco2dur utt2num_frames $utt_extra_files $spk_extra_files; do
   if [ -f $data/$x ]; then
     cp $data/$x $data/.backup/$x
